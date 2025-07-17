@@ -1,3 +1,4 @@
+// internal/message/message.go
 package message
 
 import (
@@ -19,8 +20,9 @@ type Message struct {
 	Topic     string            `json:"topic"`
 }
 
-// NewMessage creates a new message with generated ID and current timestamp
-func NewMessage(topic string, partition int, key string, value []byte, headers map[string]string) *Message {
+// NewMessage creates a new message with a generated ID and current timestamp.
+// REFACTOR: The offset is now passed in, as it's determined by the leader broker.
+func NewMessage(topic string, partition int, offset int64, key string, value []byte, headers map[string]string) *Message {
 	return &Message{
 		ID:        uuid.New().String(),
 		Key:       key,
@@ -29,43 +31,24 @@ func NewMessage(topic string, partition int, key string, value []byte, headers m
 		Timestamp: time.Now(),
 		Topic:     topic,
 		Partition: partition,
-		
+		Offset:    offset, // Assign the provided offset
 	}
 }
 
-// ToJSON converts message to JSON bytes
-func (m *Message) ToJSON() ([]byte, error) {
+// Serialize converts message to JSON bytes for storage.
+func (m *Message) Serialize() ([]byte, error) {
 	return json.Marshal(m)
 }
 
-// FromJSON creates a message from JSON bytes
-func FromJSON(data []byte) (*Message, error) {
+// Deserialize creates a message from JSON bytes.
+func Deserialize(data []byte) (*Message, error) {
 	var msg Message
 	err := json.Unmarshal(data, &msg)
 	return &msg, err
 }
 
-// Size returns the approximate size of the message in bytes
-func (m *Message) SizeAprox() int64 {
-	size := len(m.ID) + len(m.Key) + len(m.Value) + len(m.Topic)
-	for k, v := range m.Headers {
-		size += len(k) + len(v)
-	}
-	return int64(size + 64) // Add some overhead for other fields
-}
-func (m *Message) Serialize() ([]byte, error) {
-    return json.Marshal(m)
-}
-
-// Deserialize message from disk
-func Deserialize(data []byte) (*Message, error) {
-    var msg Message
-    err := json.Unmarshal(data, &msg)
-    return &msg, err
-}
-
-// Size returns the serialized size of the message
+// Size returns the serialized size of the message.
 func (m *Message) Size() int {
-    data, _ := m.Serialize()
-    return len(data)
+	data, _ := m.Serialize()
+	return len(data)
 }

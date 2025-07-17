@@ -1,7 +1,7 @@
+// internal/replication/replication.go
 package replication
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -12,458 +12,202 @@ import (
 	"Distributed-system/internal/cluster"
 	"Distributed-system/internal/message"
 	"Distributed-system/internal/storage"
-	"Distributed-system/internal/topic"
 )
 
-// ReplicationFactor defines how many replicas each partition should have
-const DefaultReplicationFactor = 3
-
-// PartitionReplica represents a replica of a partition
-type PartitionReplica struct {
-	Topic     string `json:"topic"`
-	Partition int32  `json:"partition"`
-	NodeID    string `json:"node_id"`
-	IsLeader  bool   `json:"is_leader"`
-	IsSynced  bool   `json:"is_synced"`
-	LastOffset int64 `json:"last_offset"`
-}
-
-// PartitionAssignment represents a partition assignment
-type PartitionAssignment struct {
-	Topic     string `json:"topic"`
-	Partition int    `json:"partition"`
-	LeaderID  string `json:"leader_id"`
-	Replicas  []string `json:"replicas"`
-}
-
-// ReplicationManager handles message replication between brokers
+// ReplicationManager ensures a broker's local state reflects the authoritative
+// assignments from the Raft cluster. It manages which partitions this broker
+// should lead and which it should follow.
 type ReplicationManager struct {
-	*ReplicaManager
-	brokerID    string
-	leaderPeers map[string]string // topic-partition -> leader broker ID
-	followers   map[string][]string // topic-partition -> follower broker IDs
-	isr         map[string][]string // topic-partition -> in-sync replica broker IDs
-	storage     storage.Storage
-	wal         *storage.WAL
-	cluster     *cluster.Cluster
+	brokerID string
+	cluster  *cluster.Cluster // Reference to the cluster for peer addresses and state.
+	storage  storage.Storage  // Local storage to read/write messages.
+
+	// Local state, which is a cache of the authoritative assignments from Raft.
+	assignments map[string]map[int]*cluster.PartitionAssignment
 	mu          sync.RWMutex
+	stopChan    chan struct{}
 }
 
-// NewReplicationManager creates a new replication manager
-func NewReplicationManager(brokerID string, storage storage.Storage, wal *storage.WAL, cluster *cluster.Cluster) *ReplicationManager {
+// NewReplicationManager creates a new replication manager.
+func NewReplicationManager(brokerID string, cl *cluster.Cluster, st storage.Storage) *ReplicationManager {
 	return &ReplicationManager{
-		ReplicaManager: NewReplicaManager(),
 		brokerID:    brokerID,
-		leaderPeers: make(map[string]string),
-		followers:   make(map[string][]string),
-		isr:         make(map[string][]string),
-		storage:     storage,
-		wal:         wal,
-		cluster:     cluster,
+		cluster:     cl,
+		storage:     st,
+		assignments: make(map[string]map[int]*cluster.PartitionAssignment),
+		stopChan:    make(chan struct{}),
 	}
 }
 
-// SetLeader sets the leader for a topic-partition
-func (rm *ReplicationManager) SetLeader(topic string, partition int, leaderID string) {
-	rm.mu.Lock()
-	defer rm.mu.Unlock()
-	key := fmt.Sprintf("%s-%d", topic, partition)
-	rm.leaderPeers[key] = leaderID
+// Start begins the background tasks for replication.
+func (rm *ReplicationManager) Start() {
+	go rm.syncLoop()
+	log.Printf("[INFO] ReplicationManager for broker %s started.", rm.brokerID)
 }
 
-// GetLeader gets the leader for a topic-partition
-func (rm *ReplicationManager) GetLeader(topic string, partition int) string {
-	rm.mu.RLock()
-	defer rm.mu.RUnlock()
-	key := fmt.Sprintf("%s-%d", topic, partition)
-	return rm.leaderPeers[key]
+// Stop gracefully shuts down the replication manager.
+func (rm *ReplicationManager) Stop() {
+	close(rm.stopChan)
+	log.Printf("[INFO] ReplicationManager for broker %s stopped.", rm.brokerID)
 }
 
-// AddFollower adds a follower for a topic-partition
-func (rm *ReplicationManager) AddFollower(topic string, partition int, followerID string) {
-	rm.mu.Lock()
-	defer rm.mu.Unlock()
-	key := fmt.Sprintf("%s-%d", topic, partition)
-	rm.followers[key] = append(rm.followers[key], followerID)
-}
+// syncLoop is the main loop that periodically checks the authoritative state
+// from Raft and updates the local replication state.
+func (rm *ReplicationManager) syncLoop() {
+	ticker := time.NewTicker(5 * time.Second) // Check for new assignments every 5 seconds.
+	defer ticker.Stop()
 
-// RemoveFollower removes a follower from a topic-partition
-func (rm *ReplicationManager) RemoveFollower(topic string, partition int, followerID string) {
-	rm.mu.Lock()
-	defer rm.mu.Unlock()
-	key := fmt.Sprintf("%s-%d", topic, partition)
-	
-	followers := rm.followers[key]
-	newFollowers := make([]string, 0, len(followers))
-	for _, f := range followers {
-		if f != followerID {
-			newFollowers = append(newFollowers, f)
+	for {
+		select {
+		case <-ticker.C:
+			rm.syncAssignments()
+		case <-rm.stopChan:
+			return
 		}
 	}
-	rm.followers[key] = newFollowers
 }
 
-// IsLeader checks if this broker is the leader for a topic-partition
+// syncAssignments fetches the latest assignments from the Raft FSM and updates local state.
+func (rm *ReplicationManager) syncAssignments() {
+	// Get the authoritative assignments from the Raft FSM.
+	authoritativeAssignments := rm.cluster.RaftNode.FSM.GetAssignments()
+
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+
+	// Simply replace the local cache with the latest authoritative state.
+	rm.assignments = authoritativeAssignments
+	log.Printf("[DEBUG] ReplicationManager: Synced assignments. Total topics: %d", len(rm.assignments))
+}
+
+// IsLeader checks if this broker is the leader for a given topic and partition.
 func (rm *ReplicationManager) IsLeader(topic string, partition int) bool {
 	rm.mu.RLock()
 	defer rm.mu.RUnlock()
-	key := fmt.Sprintf("%s-%d", topic, partition)
-	return rm.leaderPeers[key] == rm.brokerID
+
+	if topicAssignments, ok := rm.assignments[topic]; ok {
+		if assignment, ok := topicAssignments[partition]; ok {
+			return assignment.Leader == rm.brokerID
+		}
+	}
+	return false
 }
 
-// GetFollowers returns all followers for a topic-partition
-func (rm *ReplicationManager) GetFollowers(topic string, partition int) []string {
-	rm.mu.RLock()
-	defer rm.mu.RUnlock()
-	key := fmt.Sprintf("%s-%d", topic, partition)
-	return rm.followers[key]
-}
-
-// GetAllAssignments returns all partition assignments
-func (rm *ReplicationManager) GetAllAssignments() []*PartitionAssignment {
+// GetLeaderBrokerID returns the ID of the leader for a given partition.
+func (rm *ReplicationManager) GetLeaderBrokerID(topic string, partition int) string {
 	rm.mu.RLock()
 	defer rm.mu.RUnlock()
 
-	assignments := make([]*PartitionAssignment, 0)
-	seen := make(map[string]bool)
-
-	for key, leaderID := range rm.leaderPeers {
-		if seen[key] {
-			continue
+	if topicAssignments, ok := rm.assignments[topic]; ok {
+		if assignment, ok := topicAssignments[partition]; ok {
+			return assignment.Leader
 		}
-		seen[key] = true
-
-		// Parse topic and partition from key
-		var topic string
-		var partition int
-		fmt.Sscanf(key, "%s-%d", &topic, &partition)
-
-		assignment := &PartitionAssignment{
-			Topic:     topic,
-			Partition: partition,
-			LeaderID:  leaderID,
-			Replicas:  append([]string{leaderID}, rm.followers[key]...),
-		}
-		assignments = append(assignments, assignment)
 	}
-
-	return assignments
+	return ""
 }
 
-// ReassignPartition reassigns a partition to new replicas
-func (rm *ReplicationManager) ReassignPartition(topic string, partition int, newLeaderID string, newFollowers []string) {
-	rm.mu.Lock()
-	defer rm.mu.Unlock()
+// StartFollowerFetchRoutines starts background goroutines for every partition
+// this broker is supposed to be a follower for.
+func (rm *ReplicationManager) StartFollowerFetchRoutines() {
+	go func() {
+		ticker := time.NewTicker(10 * time.Second) // Adjust interval as needed
+		defer ticker.Stop()
 
-	key := fmt.Sprintf("%s-%d", topic, partition)
-	
-	// Update leader
-	rm.leaderPeers[key] = newLeaderID
-	
-	// Update followers
-	rm.followers[key] = newFollowers
-
-	log.Printf("Reassigned partition %s-%d: leader=%s, followers=%v", 
-		topic, partition, newLeaderID, newFollowers)
-}
-
-// ReplicateMessage replicates a message to all followers
-func (rm *ReplicationManager) ReplicateMessage(msg *message.Message) error {
-	if !rm.IsLeader(msg.Topic, msg.Partition) {
-		return fmt.Errorf("not leader for topic %s partition %d", msg.Topic, msg.Partition)
-	}
-
-	followers := rm.GetFollowers(msg.Topic, msg.Partition)
-	for _, followerID := range followers {
-		go func(followerID string) {
-			if err := rm.sendToFollower(followerID, msg); err != nil {
-				log.Printf("Failed to replicate message to follower %s: %v", followerID, err)
+		for {
+			select {
+			case <-ticker.C:
+				rm.runFollowerFetches()
+			case <-rm.stopChan:
+				return
 			}
-		}(followerID)
-	}
-	return nil
+		}
+	}()
 }
 
-// sendToFollower sends a message to a follower broker
-func (rm *ReplicationManager) sendToFollower(followerID string, msg *message.Message) error {
-	// Get the follower's address from the cluster
-	followerAddr := rm.getFollowerAddress(followerID)
-	if followerAddr == "" {
-		return fmt.Errorf("follower %s address not found", followerID)
+// runFollowerFetches iterates through all assigned partitions and, if this node
+// is a follower, fetches new messages from the leader.
+func (rm *ReplicationManager) runFollowerFetches() {
+	rm.mu.RLock()
+	assignments := rm.assignments
+	rm.mu.RUnlock()
+
+	for topic, partitionMap := range assignments {
+		for partition, assignment := range partitionMap {
+			// Check if we are a follower for this partition.
+			isFollower := false
+			for _, replicaID := range assignment.Replicas {
+				if replicaID == rm.brokerID && assignment.Leader != rm.brokerID {
+					isFollower = true
+					break
+				}
+			}
+
+			if isFollower {
+				// Run the fetch in a separate goroutine to avoid blocking.
+				go rm.fetchFromLeader(topic, partition, assignment.Leader)
+			}
+		}
+	}
+}
+
+// fetchFromLeader performs a single fetch operation from the leader for a partition.
+func (rm *ReplicationManager) fetchFromLeader(topic string, partition int, leaderID string) {
+	leaderAddr := rm.cluster.GetBrokerAddress(leaderID)
+	if leaderAddr == "" {
+		log.Printf("[WARN] Follower %s: Could not find address for leader %s of %s-%d", rm.brokerID, leaderID, topic, partition)
+		return
 	}
 
-	// Serialize the message
-	data, err := msg.Serialize()
-	if err != nil {
-		return fmt.Errorf("failed to serialize message: %v", err)
-	}
+	// Determine the offset to start fetching from.
+	offset := rm.storage.GetHighWaterMark(topic, partition)
 
-	// Send the message to the follower
-	url := fmt.Sprintf("http://%s/replication", followerAddr)
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(data))
+	// Construct the request to the leader's consume endpoint.
+	url := fmt.Sprintf("http://%s/topics/%s/partitions/%d/consume?offset=%d&limit=100", leaderAddr, topic, partition, offset)
+
+	resp, err := http.Get(url)
 	if err != nil {
-		return fmt.Errorf("failed to send message to follower: %v", err)
+		log.Printf("[ERROR] Follower %s: Failed to fetch from leader %s for %s-%d: %v", rm.brokerID, leaderID, topic, partition, err)
+		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("follower returned error status: %d", resp.StatusCode)
-	}
-
-	log.Printf("Successfully replicated message to follower %s: topic=%s, partition=%d, offset=%d",
-		followerID, msg.Topic, msg.Partition, msg.Offset)
-	return nil
-}
-
-// HandleReplicationRequest handles incoming replication requests from the leader
-func (rm *ReplicationManager) HandleReplicationRequest(w http.ResponseWriter, r *http.Request) {
-	var msg message.Message
-	if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
-		http.Error(w, "Invalid request", http.StatusBadRequest)
+		log.Printf("[WARN] Follower %s: Leader %s for %s-%d returned status %d", rm.brokerID, leaderID, topic, partition, resp.StatusCode)
 		return
 	}
 
-	// Store the replicated message
-	if err := rm.storeReplicatedMessage(&msg); err != nil {
-		log.Printf("Failed to store replicated message: %v", err)
-		http.Error(w, "Failed to store message", http.StatusInternalServerError)
+	var consumeResp struct {
+		Messages []*message.Message `json:"messages"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&consumeResp); err != nil {
+		log.Printf("[ERROR] Follower %s: Failed to decode response from leader %s for %s-%d: %v", rm.brokerID, leaderID, topic, partition, err)
 		return
 	}
 
-	log.Printf("Successfully stored replicated message: topic=%s, partition=%d, offset=%d",
-		msg.Topic, msg.Partition, msg.Offset)
-	w.WriteHeader(http.StatusOK)
-}
-
-// storeReplicatedMessage stores a replicated message
-func (rm *ReplicationManager) storeReplicatedMessage(msg *message.Message) error {
-	if rm.storage == nil {
-		return fmt.Errorf("storage not available")
-	}
-
-	// Log the storage type
-	switch rm.storage.(type) {
-	case *storage.DiskStorage:
-		log.Printf("Storing replicated message using disk storage: topic=%s, partition=%d, offset=%d",
-			msg.Topic, msg.Partition, msg.Offset)
-	case *storage.MemoryStorage:
-		log.Printf("Storing replicated message using memory storage: topic=%s, partition=%d, offset=%d",
-			msg.Topic, msg.Partition, msg.Offset)
-	default:
-		log.Printf("Storing replicated message using unknown storage type: topic=%s, partition=%d, offset=%d",
-			msg.Topic, msg.Partition, msg.Offset)
-	}
-
-	// Store the message
-	if err := rm.storage.Store(msg); err != nil {
-		return fmt.Errorf("failed to store replicated message: %v", err)
-	}
-
-	// Write to WAL if available
-	if rm.wal != nil {
-		_ = rm.wal.WriteMessage(msg.Topic, int32(msg.Partition), msg)
-	}
-
-	return nil
-}
-
-// getFollowerAddress gets the address of a follower broker
-func (rm *ReplicationManager) getFollowerAddress(followerID string) string {
-	if rm.cluster == nil {
-		return ""
-	}
-	return rm.cluster.GetBrokerAddress(followerID)
-}
-
-// getStorage gets the storage interface from the broker
-func (rm *ReplicationManager) getStorage() storage.Storage {
-	return rm.storage
-}
-
-// HandleReassignmentRequest handles partition reassignment requests
-func (rm *ReplicationManager) HandleReassignmentRequest(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Topic     string   `json:"topic"`
-		Partition int      `json:"partition"`
-		LeaderID  string   `json:"leader_id"`
-		Replicas  []string `json:"replicas"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid request", http.StatusBadRequest)
-		return
-	}
-
-	// Update assignment
-	rm.ReassignPartition(req.Topic, req.Partition, req.LeaderID, req.Replicas)
-
-	w.WriteHeader(http.StatusOK)
-}
-
-// ReplicationStatus represents the current replication status
-type ReplicationStatus struct {
-	NodeID             string              `json:"node_id"`
-	LeaderPartitions   map[string][]int32  `json:"leader_partitions"`
-	FollowerPartitions map[string][]int32  `json:"follower_partitions"`
-	ReplicationFactor  int                 `json:"replication_factor"`
-	QueueSize          int                 `json:"queue_size"`
-}
-
-// Stop stops the replication manager and cleans up resources
-func (rm *ReplicationManager) Stop() error {
-	// Close any open replication connections
-	rm.mu.Lock()
-	defer rm.mu.Unlock()
-
-	// Clear any pending replication tasks
-	rm.leaderPeers = make(map[string]string)
-	rm.followers = make(map[string][]string)
-
-	return nil
-}
-
-// ReplicateTopicCreation replicates topic creation across the cluster
-func (rm *ReplicationManager) ReplicateTopicCreation(topic string, config *topic.TopicConfig) error {
-	rm.mu.Lock()
-	defer rm.mu.Unlock()
-
-	// Get all brokers in the cluster
-	brokers := rm.getClusterBrokers()
-	if len(brokers) == 0 {
-		return fmt.Errorf("no brokers available for replication")
-	}
-
-	// Create topic on all brokers
-	for _, brokerID := range brokers {
-		if brokerID == rm.brokerID {
-			continue // Skip self
-		}
-
-		// Get broker address
-		brokerAddr := rm.getFollowerAddress(brokerID)
-		if brokerAddr == "" {
-			log.Printf("Warning: Could not find address for broker %s", brokerID)
-			continue
-		}
-
-		// Send topic creation request
-		url := fmt.Sprintf("http://%s/topics/%s", brokerAddr, topic)
-		data, err := json.Marshal(map[string]interface{}{
-			"num_partitions":     config.NumPartitions,
-			"replication_factor": config.ReplicationFactor,
-		})
-		if err != nil {
-			log.Printf("Warning: Failed to marshal topic config for broker %s: %v", brokerID, err)
-			continue
-		}
-
-		resp, err := http.Post(url, "application/json", bytes.NewBuffer(data))
-		if err != nil {
-			log.Printf("Warning: Failed to create topic on broker %s: %v", brokerID, err)
-			continue
-		}
-		resp.Body.Close()
-
-		if resp.StatusCode != http.StatusCreated {
-			log.Printf("Warning: Broker %s returned error status %d for topic creation", 
-				brokerID, resp.StatusCode)
-			continue
-		}
-
-		log.Printf("Successfully created topic %s on broker %s", topic, brokerID)
-	}
-
-	return nil
-}
-
-// getClusterBrokers returns all broker IDs in the cluster
-func (rm *ReplicationManager) getClusterBrokers() []string {
-	// In a real implementation, this would get the list from the cluster manager
-	// For now, return a hardcoded list
-	return []string{"broker-1", "broker-2", "broker-3"}
-}
-
-// SetFollowers sets the followers for a topic-partition and initializes ISR
-func (rm *ReplicationManager) SetFollowers(topic string, partition int, followers []string) {
-	rm.mu.Lock()
-	defer rm.mu.Unlock()
-	key := fmt.Sprintf("%s-%d", topic, partition)
-	rm.followers[key] = followers
-	// Initialize ISR to all replicas (including leader)
-	isr := make([]string, 0, len(followers)+1)
-	isr = append(isr, rm.leaderPeers[key])
-	isr = append(isr, followers...)
-	rm.isr[key] = isr
-}
-
-// MarkReplicaInSync marks a replica as in-sync for a topic-partition
-func (rm *ReplicationManager) MarkReplicaInSync(topic string, partition int, brokerID string) {
-	rm.mu.Lock()
-	defer rm.mu.Unlock()
-	key := fmt.Sprintf("%s-%d", topic, partition)
-	for _, id := range rm.isr[key] {
-		if id == brokerID {
-			return // already in ISR
-		}
-	}
-	rm.isr[key] = append(rm.isr[key], brokerID)
-}
-
-// RemoveReplicaFromISR removes a replica from ISR
-func (rm *ReplicationManager) RemoveReplicaFromISR(topic string, partition int, brokerID string) {
-	rm.mu.Lock()
-	defer rm.mu.Unlock()
-	key := fmt.Sprintf("%s-%d", topic, partition)
-	newISR := make([]string, 0, len(rm.isr[key]))
-	for _, id := range rm.isr[key] {
-		if id != brokerID {
-			newISR = append(newISR, id)
-		}
-	}
-	rm.isr[key] = newISR
-}
-
-// GetISR returns the list of in-sync replicas for a topic-partition
-func (rm *ReplicationManager) GetISR(topic string, partition int) []string {
-	rm.mu.RLock()
-	defer rm.mu.RUnlock()
-	key := fmt.Sprintf("%s-%d", topic, partition)
-	return append([]string{}, rm.isr[key]...)
-}
-
-// StartFollowerReplicationLoop starts a background loop to fetch messages from leaders for all followed partitions
-func (rm *ReplicationManager) StartFollowerReplicationLoop(fetchFunc func(topic string, partition int, offset int64, leaderID string) ([]*message.Message, error)) {
-	go func() {
-		for {
-			time.Sleep(2 * time.Second)
-			rm.mu.RLock()
-			for key, followers := range rm.followers {
-				// key is topic-partition string
-				var topic string
-				var partition int
-				fmt.Sscanf(key, "%s-%d", &topic, &partition)
-				for _, followerID := range followers {
-					if followerID == rm.brokerID {
-						leaderID := rm.leaderPeers[key]
-						if leaderID == "" || leaderID == rm.brokerID {
-							continue // No leader or self-leader
-						}
-						// Get last offset for this partition
-						lastOffset := rm.storage.GetHighWaterMark(topic, partition)
-						msgs, err := fetchFunc(topic, partition, lastOffset, leaderID)
-						if err != nil {
-							log.Printf("Follower failed to fetch from leader: %v", err)
-							continue
-						}
-						for _, msg := range msgs {
-							if err := rm.storeReplicatedMessage(msg); err == nil {
-								rm.MarkReplicaInSync(topic, partition, rm.brokerID)
-							}
-						}
-					}
-				}
+	if len(consumeResp.Messages) > 0 {
+		log.Printf("[INFO] Follower %s: Fetched %d messages from leader %s for %s-%d", rm.brokerID, len(consumeResp.Messages), leaderID, topic, partition)
+		for _, msg := range consumeResp.Messages {
+			if err := rm.storage.Store(msg); err != nil {
+				log.Printf("[ERROR] Follower %s: Failed to store replicated message for %s-%d at offset %d: %v", rm.brokerID, topic, partition, msg.Offset, err)
 			}
-			rm.mu.RUnlock()
 		}
-	}()
+	}
+}
+
+// HandleReplicationRequest is an HTTP handler for the leader to send messages to followers.
+// THIS IS NO LONGER USED in the pull model, but the endpoint can be kept for other purposes or removed.
+// For now, we will leave it as a no-op to avoid breaking API contracts if needed.
+func (rm *ReplicationManager) HandleReplicationRequest(w http.ResponseWriter, r *http.Request) {
+	// In a pull-based system, this endpoint is not used for message replication.
+	// A leader never pushes messages to followers.
+	http.Error(w, "Endpoint not used in pull-based replication", http.StatusNotImplemented)
+}
+
+// ReplicateMessage is called by the produce logic on the leader.
+// In a pull-based system, this is a NO-OP. The message is simply stored locally.
+// Followers will fetch it later.
+func (rm *ReplicationManager) ReplicateMessage(msg *message.Message) error {
+	// No action needed. The message is already stored on the leader via broker.Produce.
+	// The follower's `fetchFromLeader` loop will replicate it.
+	return nil
 }

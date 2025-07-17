@@ -7,14 +7,6 @@ import (
 	"Distributed-system/internal/message"
 )
 
-// Storage defines the interface for message storage
-type Storage interface {
-	Store(msg *message.Message) error
-	GetMessage(topic string, partition int, offset int64) (*message.Message, error)
-	GetMessages(topic string, partition int, startOffset int64, limit int) ([]*message.Message, error)
-	GetHighWaterMark(topic string, partition int) int64
-}
-
 // PartitionKey represents a unique identifier for a partition
 type PartitionKey struct {
 	Topic     string
@@ -207,4 +199,15 @@ func (ms *MemoryStorage) Clear() {
 
 	ms.messages = make(map[PartitionKey]map[int64]*message.Message)
 	ms.indexes = make(map[PartitionKey]map[string][]*message.Message)
+}
+
+// Add EnsureTopicDirs and Close methods to MemoryStorage to satisfy the Storage interface
+func (ms *MemoryStorage) EnsureTopicDirs(meta interface{}) error {
+	// No-op for in-memory storage
+	return nil
+}
+
+func (ms *MemoryStorage) Close() error {
+	// No-op for in-memory storage
+	return nil
 }

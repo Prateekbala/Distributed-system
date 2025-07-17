@@ -1,3 +1,4 @@
+// internal/offset/manager.go
 package offset
 
 import (

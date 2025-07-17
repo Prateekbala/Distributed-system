@@ -4,7 +4,6 @@ package storage
 import (
 	"bufio"
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -12,241 +11,146 @@ import (
 
 	"Distributed-system/internal/config"
 	"Distributed-system/internal/message"
-	"Distributed-system/internal/topic"
 )
 
+// WALEntry represents a single entry in the Write-Ahead Log.
+// REFACTOR: Simplified to only contain message data.
 type WALEntry struct {
-    Type      string          `json:"type"`      // "message", "topic_create", "topic_delete"
-    Topic     string          `json:"topic"`
-    Config    *topic.TopicConfig `json:"config,omitempty"`  // Add topic configuration
-    Partition int32           `json:"partition"`
-    Message   *message.Message `json:"message,omitempty"`
-    Timestamp time.Time       `json:"timestamp"`
-    LSN       int64           `json:"lsn"` // Log Sequence Number
+	Type      string           `json:"type"` // "message"
+	Message   *message.Message `json:"message"`
+	Timestamp time.Time        `json:"timestamp"`
 }
 
+// WAL provides a durable, append-only log for recovering in-flight messages.
 type WAL struct {
-    config     *config.Config
-    file       *os.File
-    writer     *bufio.Writer
-    lsn        int64
-    mu         sync.Mutex
-    syncTicker *time.Ticker
+	config     *config.Config
+	file       *os.File
+	writer     *bufio.Writer
+	mu         sync.Mutex
+	syncTicker *time.Ticker
 }
 
+// NewWAL creates or opens a WAL file.
 func NewWAL(cfg *config.Config) (*WAL, error) {
-    walDir := filepath.Join(cfg.DataDir, "wal")
-    if err := os.MkdirAll(walDir, 0755); err != nil {
-        return nil, err
-    }
-    
-    walFile := filepath.Join(walDir, "wal.log")
-    file, err := os.OpenFile(walFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-    if err != nil {
-        return nil, err
-    }
-    
-    wal := &WAL{
-        config: cfg,
-        file:   file,
-        writer: bufio.NewWriter(file),
-        lsn:    0,
-    }
-    
-    // Load existing LSN
-    wal.loadLSN()
-    
-    // Start sync ticker if enabled
-    if cfg.WALEnabled {
-        wal.syncTicker = time.NewTicker(cfg.WALSyncInterval)
-        go wal.syncLoop()
-    }
-    
-    return wal, nil
+	if !cfg.WALEnabled {
+		return &WAL{config: cfg}, nil // Return a no-op WAL if disabled
+	}
+
+	walDir := filepath.Join(cfg.DataDir, "wal")
+	if err := os.MkdirAll(walDir, 0755); err != nil {
+		return nil, err
+	}
+
+	walFile := filepath.Join(walDir, "wal.log")
+	file, err := os.OpenFile(walFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0666)
+	if err != nil {
+		return nil, err
+	}
+
+	wal := &WAL{
+		config: cfg,
+		file:   file,
+		writer: bufio.NewWriter(file),
+	}
+
+	// Start sync ticker
+	wal.syncTicker = time.NewTicker(cfg.WALSyncInterval)
+	go wal.syncLoop()
+
+	return wal, nil
 }
 
+// WriteMessage writes a message entry to the log.
 func (w *WAL) WriteMessage(topic string, partition int32, msg *message.Message) error {
-    if !w.config.WALEnabled {
-        return nil
-    }
-    
-    w.mu.Lock()
-    defer w.mu.Unlock()
-    
-    w.lsn++
-    
-    entry := WALEntry{
-        Type:      "message",
-        Topic:     topic,
-        Partition: partition,
-        Message:   msg,
-        Timestamp: time.Now(),
-        LSN:       w.lsn,
-    }
-    
-    data, err := json.Marshal(entry)
-    if err != nil {
-        return err
-    }
-    
-    // Write entry length first, then entry data
-    lengthLine := fmt.Sprintf("%010d\n", len(data))
-    if _, err := w.writer.WriteString(lengthLine); err != nil {
-        return err
-    }
-    
-    if _, err := w.writer.Write(data); err != nil {
-        return err
-    }
-    
-    if _, err := w.writer.WriteString("\n"); err != nil {
-        return err
-    }
-    
-    return nil
+	if !w.config.WALEnabled || w.file == nil {
+		return nil
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	entry := WALEntry{
+		Type:      "message",
+		Message:   msg,
+		Timestamp: time.Now(),
+	}
+
+	data, err := json.Marshal(entry)
+	if err != nil {
+		return err
+	}
+
+	// Write with a newline delimiter for easier scanning.
+	if _, err := w.writer.Write(data); err != nil {
+		return err
+	}
+	if _, err := w.writer.WriteString("\n"); err != nil {
+		return err
+	}
+
+	return nil
 }
 
-func (w *WAL) WriteTopicEvent(eventType, topic string, config *topic.TopicConfig) error {
-    if !w.config.WALEnabled {
-        return nil
-    }
-    
-    w.mu.Lock()
-    defer w.mu.Unlock()
-    
-    w.lsn++
-    
-    entry := WALEntry{
-        Type:      eventType,
-        Topic:     topic,
-        Config:    config,
-        Timestamp: time.Now(),
-        LSN:       w.lsn,
-    }
-    
-    data, err := json.Marshal(entry)
-    if err != nil {
-        return err
-    }
-    
-    lengthLine := fmt.Sprintf("%010d\n", len(data))
-    if _, err := w.writer.WriteString(lengthLine); err != nil {
-        return err
-    }
-    
-    if _, err := w.writer.Write(data); err != nil {
-        return err
-    }
-    
-    if _, err := w.writer.WriteString("\n"); err != nil {
-        return err
-    }
-    
-    return nil
-}
-
-func (w *WAL) WriteTopicCreate(topic string, config *topic.TopicConfig) error {
-	return w.WriteTopicEvent("topic_create", topic, config)
-}
-
+// Sync flushes the WAL writer buffer to disk.
 func (w *WAL) Sync() error {
-    w.mu.Lock()
-    defer w.mu.Unlock()
-    
-    if err := w.writer.Flush(); err != nil {
-        return err
-    }
-    
-    return w.file.Sync()
+	if !w.config.WALEnabled || w.file == nil {
+		return nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if err := w.writer.Flush(); err != nil {
+		return err
+	}
+	return w.file.Sync()
 }
 
+// syncLoop periodically calls Sync.
 func (w *WAL) syncLoop() {
-    for range w.syncTicker.C {
-        w.Sync()
-    }
+	if w.syncTicker == nil {
+		return
+	}
+	for range w.syncTicker.C {
+		w.Sync()
+	}
 }
 
+// Close flushes and closes the WAL file.
 func (w *WAL) Close() error {
-    if w.syncTicker != nil {
-        w.syncTicker.Stop()
-    }
-    
-    w.mu.Lock()
-    defer w.mu.Unlock()
-    
-    if err := w.writer.Flush(); err != nil {
-        return err
-    }
-    
-    return w.file.Close()
+	if !w.config.WALEnabled || w.file == nil {
+		return nil
+	}
+	if w.syncTicker != nil {
+		w.syncTicker.Stop()
+	}
+	return w.Sync()
 }
 
-func (w *WAL) loadLSN() {
-    // Read the WAL file to find the highest LSN
-    file, err := os.Open(w.file.Name())
-    if err != nil {
-        return
-    }
-    defer file.Close()
-    
-    scanner := bufio.NewScanner(file)
-    maxLSN := int64(0)
-    
-    for scanner.Scan() {
-        lengthLine := scanner.Text()
-        if len(lengthLine) != 10 {
-            continue
-        }
-        
-        // Read the actual entry
-        if !scanner.Scan() {
-            break
-        }
-        
-        entryData := scanner.Bytes()
-        var entry WALEntry
-        if err := json.Unmarshal(entryData, &entry); err != nil {
-            continue
-        }
-        
-        if entry.LSN > maxLSN {
-            maxLSN = entry.LSN
-        }
-    }
-    
-    w.lsn = maxLSN
-}
-
-// Recovery reads the WAL and returns all entries for replay
+// Recovery reads the entire WAL and returns all valid entries for replay.
 func (w *WAL) Recovery() ([]WALEntry, error) {
-    file, err := os.Open(w.file.Name())
-    if err != nil {
-        return nil, err
-    }
-    defer file.Close()
-    
-    var entries []WALEntry
-    scanner := bufio.NewScanner(file)
-    
-    for scanner.Scan() {
-        lengthLine := scanner.Text()
-        if len(lengthLine) != 10 {
-            continue
-        }
-        
-        // Read the actual entry
-        if !scanner.Scan() {
-            break
-        }
-        
-        entryData := scanner.Bytes()
-        var entry WALEntry
-        if err := json.Unmarshal(entryData, &entry); err != nil {
-            continue
-        }
-        
-        entries = append(entries, entry)
-    }
-    
-    return entries, scanner.Err()
+	if !w.config.WALEnabled {
+		return []WALEntry{}, nil
+	}
+
+	// Ensure all data is flushed before reading
+	w.Sync()
+
+	file, err := os.Open(w.file.Name())
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var entries []WALEntry
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		var entry WALEntry
+		if err := json.Unmarshal(scanner.Bytes(), &entry); err == nil {
+			if entry.Type == "message" && entry.Message != nil {
+				entries = append(entries, entry)
+			}
+		}
+	}
+
+	return entries, scanner.Err()
 }
