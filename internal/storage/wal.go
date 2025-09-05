@@ -14,7 +14,6 @@ import (
 )
 
 // WALEntry represents a single entry in the Write-Ahead Log.
-// REFACTOR: Simplified to only contain message data.
 type WALEntry struct {
 	Type      string           `json:"type"` // "message"
 	Message   *message.Message `json:"message"`

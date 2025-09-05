@@ -1,4 +1,3 @@
-// internal/cluster/raft.go
 package cluster
 
 import (
@@ -15,33 +14,28 @@ import (
 	raftboltdb "github.com/hashicorp/raft-boltdb"
 )
 
-// RaftCommandType defines the type of a command for the Raft log.
 type RaftCommandType string
 
 const (
 	CmdCreateTopic        RaftCommandType = "create_topic"
 	CmdDeleteTopic        RaftCommandType = "delete_topic"
 	CmdAssignPartitions   RaftCommandType = "assign_partitions"
-	CmdUpdateConsumerGroup RaftCommandType = "update_consumer_group" // New command type
+	CmdUpdateConsumerGroup RaftCommandType = "update_consumer_group" 
 )
 
-// RaftCommand is a generic command applied to the Raft log.
 type RaftCommand struct {
 	Type    RaftCommandType `json:"type"`
 	Payload json.RawMessage `json:"payload"`
 }
 
-// RaftNode wraps the raft.Raft instance and its FSM.
+
 type RaftNode struct {
 	Raft *raft.Raft
 	FSM  *RaftClusterFSM
 }
-
-// RaftClusterFSM implements raft.FSM for managing cluster metadata.
-// It is the single source of truth for topics, partition assignments, AND consumer groups.
 type RaftClusterFSM struct {
 	mu    sync.RWMutex
-	state *MetadataStore // The state managed by Raft consensus.
+	state *MetadataStore 
 }
 
 // NewRaftClusterFSM creates a new, empty FSM.
@@ -51,7 +45,7 @@ func NewRaftClusterFSM() *RaftClusterFSM {
 	}
 }
 
-// Apply applies a Raft log entry to the finite state machine.
+
 func (f *RaftClusterFSM) Apply(logEntry *raft.Log) interface{} {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -122,21 +116,20 @@ func (f *RaftClusterFSM) Apply(logEntry *raft.Log) interface{} {
 	return nil
 }
 
-// GetAssignments returns a deep copy of the current partition assignments.
 func (f *RaftClusterFSM) GetAssignments() map[string]map[int]*PartitionAssignment {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	return f.state.copyAssignments()
 }
 
-// GetTopics returns a copy of the current topics.
+
 func (f *RaftClusterFSM) GetTopics() map[string]*TopicMetadata {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	return f.state.copyTopics()
 }
 
-// GetConsumerGroups returns a deep copy of the current consumer groups.
+
 func (f *RaftClusterFSM) GetConsumerGroups() map[string]*ConsumerGroup {
     f.mu.RLock()
     defer f.mu.RUnlock()
@@ -144,7 +137,6 @@ func (f *RaftClusterFSM) GetConsumerGroups() map[string]*ConsumerGroup {
 }
 
 
-// Snapshot returns a snapshot of the FSM state.
 func (f *RaftClusterFSM) Snapshot() (raft.FSMSnapshot, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
@@ -158,7 +150,7 @@ func (f *RaftClusterFSM) Snapshot() (raft.FSMSnapshot, error) {
 	return &RaftClusterSnapshot{data: data}, nil
 }
 
-// Restore restores the FSM from a snapshot.
+
 func (f *RaftClusterFSM) Restore(rc io.ReadCloser) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -173,13 +165,10 @@ func (f *RaftClusterFSM) Restore(rc io.ReadCloser) error {
 	log.Printf("[INFO] RaftFSM: State restored successfully from snapshot.")
 	return nil
 }
-
-// RaftClusterSnapshot implements the FSMSnapshot interface.
 type RaftClusterSnapshot struct {
 	data []byte
 }
 
-// Persist writes the snapshot data to a sink.
 func (s *RaftClusterSnapshot) Persist(sink raft.SnapshotSink) error {
 	if _, err := sink.Write(s.data); err != nil {
 		_ = sink.Cancel()
@@ -188,16 +177,13 @@ func (s *RaftClusterSnapshot) Persist(sink raft.SnapshotSink) error {
 	return sink.Close()
 }
 
-// Release is a no-op.
 func (s *RaftClusterSnapshot) Release() {}
 
-// --- Raft Node Setup ---
 
 const raftTimeout = 10 * time.Second
 
 // NewRaftNode initializes a Raft node.
 func NewRaftNode(dataDir, nodeID, bindAddr string, bootstrap bool) (*RaftNode, error) {
-    // ... (rest of the function is unchanged)
     config := raft.DefaultConfig()
     config.LocalID = raft.ServerID(nodeID)
     config.SnapshotThreshold = 1024
@@ -251,7 +237,7 @@ func NewRaftNode(dataDir, nodeID, bindAddr string, bootstrap bool) (*RaftNode, e
     return &RaftNode{Raft: r, FSM: fsm}, nil
 }
 
-// ProposeCommand proposes a command to the Raft cluster.
+
 func (rn *RaftNode) ProposeCommand(cmd RaftCommand) error {
 	data, err := json.Marshal(cmd)
 	if err != nil {

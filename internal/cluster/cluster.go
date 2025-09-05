@@ -71,7 +71,7 @@ type ConsumerGroup struct {
 // Consumer represents a single consumer process.
 type Consumer struct {
 	ID            string `json:"id"`
-	LastHeartbeat int64  `json:"last_heartbeat"` // Unix timestamp
+	LastHeartbeat int64  `json:"last_heartbeat"` 
 }
 
 // NewMetadataStore initializes a new metadata store.
@@ -210,7 +210,6 @@ func (c *Cluster) leaderLoop() {
 
 // Stop gracefully shuts down the cluster manager.
 func (c *Cluster) Stop() {
-	// ... (stop logic is unchanged)
     close(c.stopChan)
     if c.ml != nil {
         c.ml.Leave(5 * time.Second)
@@ -226,7 +225,7 @@ func (c *Cluster) Stop() {
 
 // IsLeader returns true if this node is the current Raft leader.
 func (c *Cluster) IsLeader() bool {
-	// ... (unchanged)
+	
     if c.RaftNode == nil || c.RaftNode.Raft == nil {
         return false
     }
@@ -235,7 +234,7 @@ func (c *Cluster) IsLeader() bool {
 
 // GetBrokerAddress returns the API address for a given broker ID.
 func (c *Cluster) GetBrokerAddress(brokerID string) string {
-	// ... (unchanged)
+	
     c.mu.RLock()
     defer c.mu.RUnlock()
 
@@ -252,7 +251,7 @@ func (c *Cluster) GetBrokerAddress(brokerID string) string {
 // --- Topic and Partition Management ---
 
 func (c *Cluster) ProposeTopicCreation(name string, partitions, replicationFactor int) error {
-	// ... (unchanged, but now calls RebalancePartitions)
+
     if !c.IsLeader() {
         leaderAddr := c.GetBrokerAddress(string(c.RaftNode.Raft.Leader()))
         return fmt.Errorf("not the leader, please send request to %s", leaderAddr)
@@ -272,7 +271,7 @@ func (c *Cluster) ProposeTopicCreation(name string, partitions, replicationFacto
 }
 
 func (c *Cluster) RebalancePartitions() {
-	// ... (logic is the same, just renamed from rebalanceCluster)
+	
     if !c.IsLeader() {
         return
     }
@@ -332,7 +331,6 @@ func (c *Cluster) RebalancePartitions() {
 
 // --- Consumer Group Management (New Logic) ---
 
-// RegisterConsumer handles a consumer joining a group. It's a leader operation.
 func (c *Cluster) RegisterConsumer(groupID, consumerID string, topics []string) error {
     if !c.IsLeader() {
         return fmt.Errorf("not the leader")
@@ -354,14 +352,14 @@ func (c *Cluster) RegisterConsumer(groupID, consumerID string, topics []string) 
         LastHeartbeat: time.Now().Unix(),
     }
 
-    // Propose the updated group state to the cluster
+
     payload, _ := json.Marshal(group)
     cmd := RaftCommand{Type: CmdUpdateConsumerGroup, Payload: payload}
     if err := c.RaftNode.ProposeCommand(cmd); err != nil {
         return fmt.Errorf("failed to propose consumer registration: %w", err)
     }
 
-    go c.rebalanceConsumerGroup(group.ID) // Trigger rebalance
+    go c.rebalanceConsumerGroup(group.ID)
     return nil
 }
 
@@ -450,10 +448,6 @@ func (c *Cluster) rebalanceConsumerGroup(groupID string) {
         log.Printf("[ERROR] Failed to propose rebalance for group %s: %v", groupID, err)
     }
 }
-
-// --- Memberlist Delegate and Helpers ---
-// ... (handleJoin, handleLeave, memberlistEventDelegate, isAssignmentValid, HandleRaftJoin are mostly unchanged)
-// ... The only change is that handleLeave should also trigger rebalances.
 
 func (c *Cluster) handleLeave(node *memberlist.Node) {
     c.mu.Lock()

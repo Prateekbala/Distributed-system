@@ -195,8 +195,6 @@ func (rm *ReplicationManager) fetchFromLeader(topic string, partition int, leade
 }
 
 // HandleReplicationRequest is an HTTP handler for the leader to send messages to followers.
-// THIS IS NO LONGER USED in the pull model, but the endpoint can be kept for other purposes or removed.
-// For now, we will leave it as a no-op to avoid breaking API contracts if needed.
 func (rm *ReplicationManager) HandleReplicationRequest(w http.ResponseWriter, r *http.Request) {
 	// In a pull-based system, this endpoint is not used for message replication.
 	// A leader never pushes messages to followers.

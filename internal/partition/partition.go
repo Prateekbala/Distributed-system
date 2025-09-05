@@ -207,8 +207,6 @@ func (cgm *ConsumerGroupManager) RemoveConsumer(groupID, consumerID string) erro
 
 // rebalanceGroup redistributes partitions among consumers in a group
 func (cgm *ConsumerGroupManager) rebalanceGroup(group *ConsumerGroup, topics []string) {
-	// Get partition counts for each topic (this should come from topic manager)
-	// For now, we'll assume a fixed number of partitions per topic
 	topicPartitions := make(map[string]int)
 	for _, topic := range topics {
 		topicPartitions[topic] = 3 // Default to 3 partitions per topic

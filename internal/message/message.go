@@ -20,8 +20,6 @@ type Message struct {
 	Topic     string            `json:"topic"`
 }
 
-// NewMessage creates a new message with a generated ID and current timestamp.
-// REFACTOR: The offset is now passed in, as it's determined by the leader broker.
 func NewMessage(topic string, partition int, offset int64, key string, value []byte, headers map[string]string) *Message {
 	return &Message{
 		ID:        uuid.New().String(),
