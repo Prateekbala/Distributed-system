@@ -124,6 +124,11 @@ func NewServer() (*Server, error) {
 		return nil, fmt.Errorf("failed to start cluster: %w", err)
 	}
 
+	// Wait for Raft to stabilize if this is a bootstrap node
+	if *bootstrap {
+		time.Sleep(2 * time.Second)
+	}
+
 	// --- 5. Broker Initialization ---
 	// REFACTOR: Broker no longer needs local managers. It gets all state from the cluster.
 	brokerInstance := broker.NewBroker(*nodeID, clusterManager, diskStorage, wal, offsetManager)
@@ -227,7 +232,6 @@ func (s *Server) handleProduce(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleConsume(w http.ResponseWriter, r *http.Request) {
-	// ... (no change in logic)
 	vars := mux.Vars(r)
 	topicName := vars["topic"]
 	partition, _ := strconv.Atoi(vars["partition"])

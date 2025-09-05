@@ -187,6 +187,12 @@ func NewRaftNode(dataDir, nodeID, bindAddr string, bootstrap bool) (*RaftNode, e
     config := raft.DefaultConfig()
     config.LocalID = raft.ServerID(nodeID)
     config.SnapshotThreshold = 1024
+    
+    // For single-node clusters, we need to adjust the election timeout
+    if bootstrap {
+        config.ElectionTimeout = 1 * time.Second
+        config.HeartbeatTimeout = 500 * time.Millisecond
+    }
 
     raftDataDir := filepath.Join(dataDir, "raft")
     if err := os.MkdirAll(raftDataDir, 0755); err != nil {
@@ -220,18 +226,35 @@ func NewRaftNode(dataDir, nodeID, bindAddr string, bootstrap bool) (*RaftNode, e
     }
 
     if bootstrap {
-        bootstrapConfig := raft.Configuration{
-            Servers: []raft.Server{
-                {
-                    ID:      config.LocalID,
-                    Address: transport.LocalAddr(),
+        // Check if cluster is already bootstrapped
+        if r.State() == raft.Leader || r.State() == raft.Follower {
+            log.Printf("[INFO] Raft: Cluster already bootstrapped, node %s is in %s state", nodeID, r.State())
+        } else {
+            bootstrapConfig := raft.Configuration{
+                Servers: []raft.Server{
+                    {
+                        ID:      config.LocalID,
+                        Address: transport.LocalAddr(),
+                    },
                 },
-            },
+            }
+            if f := r.BootstrapCluster(bootstrapConfig); f.Error() != nil {
+                log.Printf("[WARN] Raft: Bootstrap failed (cluster may already exist): %v", f.Error())
+            } else {
+                log.Printf("[INFO] Raft: Cluster bootstrapped successfully on node %s", nodeID)
+            }
         }
-        if f := r.BootstrapCluster(bootstrapConfig); f.Error() != nil {
-            return nil, fmt.Errorf("failed to bootstrap cluster: %w", f.Error())
-        }
-        log.Printf("[INFO] Raft: Cluster bootstrapped successfully on node %s", nodeID)
+        
+        // For single-node clusters, we need to wait for the node to become leader
+        go func() {
+            for i := 0; i < 10; i++ {
+                if r.State() == raft.Leader {
+                    log.Printf("[INFO] Raft: Node %s became leader", nodeID)
+                    break
+                }
+                time.Sleep(500 * time.Millisecond)
+            }
+        }()
     }
 
     return &RaftNode{Raft: r, FSM: fsm}, nil

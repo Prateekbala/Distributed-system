@@ -46,6 +46,12 @@ func (ds *DiskStorage) loadExistingPartitions() {
 	defer ds.mu.Unlock()
 
 	topicsDir := filepath.Join(ds.config.DataDir, "topics")
+	// Create topics directory if it doesn't exist
+	if err := os.MkdirAll(topicsDir, 0755); err != nil {
+		log.Printf("[ERROR] Failed to create topics directory: %v", err)
+		return
+	}
+
 	topicDirs, err := os.ReadDir(topicsDir)
 	if err != nil {
 		log.Printf("[INFO] Topics directory not found or unreadable, starting fresh. Error: %v", err)
