@@ -90,8 +90,8 @@ graph TB
     end
 
     subgraph "Monitoring"
-        PROM[Prometheus]
-        GRAF[Grafana]
+        METRICS[System Metrics]
+        HEALTH[Health Checks]
     end
 
     P --> LB
@@ -116,10 +116,10 @@ graph TB
     S1 --> SEG
     S1 --> MEM
 
-    B1 --> PROM
-    B2 --> PROM
-    BN --> PROM
-    PROM --> GRAF
+    B1 --> METRICS
+    B2 --> METRICS
+    BN --> METRICS
+    METRICS --> HEALTH
 ```
 
 ---
@@ -128,9 +128,11 @@ graph TB
 
 ### Prerequisites
 
-- Go 1.21 or higher
+- Go 1.24 or higher
 - Docker & Docker Compose (optional)
 - jq (for JSON formatting in tests)
+- curl (for API testing)
+- bash (for running test scripts)
 
 ### 1. Clone and Build
 
@@ -160,20 +162,36 @@ go run ./cmd/broker/main.go --node-id=node2 --port=8082 --cluster-port=7967 --ad
 ### 4. Run Automated Tests
 
 ```bash
-# Linux/Mac
-chmod +x test_cluster.sh
-./test_cluster.sh
+# Quick benchmark (recommended for quick testing)
+chmod +x quick_benchmark.sh
+./quick_benchmark.sh
 
-# Windows
-test_cluster.bat
+# Comprehensive benchmark suite
+chmod +x benchmark_suite.sh
+./benchmark_suite.sh
+
+# High performance benchmark (target 17K+ msgs/sec)
+chmod +x high_performance_benchmark.sh
+./high_performance_benchmark.sh
+
+# Industry-level benchmark comparison
+chmod +x industry_benchmark.sh
+./industry_benchmark.sh
 ```
 
-### 5. Docker Compose (Full Stack)
+### 5. Docker Deployment
 
 ```bash
+# Build the Docker image
+docker build -t kafka-broker .
+
+# Run single broker
+docker run -p 8080:8080 -p 7946:7946 -p 8946:8946 \
+  -v $(pwd)/data:/home/appuser/data \
+  kafka-broker --node-id=broker1 --port=8080 --cluster-port=7946
+
+# Run multi-broker cluster
 docker-compose up -d
-# Access Grafana at http://localhost:3000 (admin/admin)
-# Access Prometheus at http://localhost:9090
 ```
 
 ---
@@ -301,13 +319,6 @@ type Config struct {
 - **System**: CPU, memory, network utilization
 - **Consumer Groups**: Lag, active consumers, assignment status
 
-### **Grafana Dashboards**
-
-- **Cluster Overview**: Node health, partition distribution
-- **Performance**: Throughput, latency, error rates
-- **Storage**: Disk usage, segment metrics
-- **Replication**: Lag monitoring, replica status
-
 ### **Health Checks**
 
 ```bash
@@ -317,7 +328,7 @@ curl http://localhost:8080/health
 # Detailed cluster status
 curl http://localhost:8080/cluster/status | jq .
 
-# Prometheus metrics
+# System metrics
 curl http://localhost:8080/metrics
 ```
 
@@ -403,7 +414,59 @@ func (c *Cluster) rebalanceConsumerGroup(groupID string) {
 
 ## 🧪 **Testing & Validation**
 
-### **Load Testing**
+### **Automated Test Scripts**
+
+The project includes four comprehensive test scripts for different benchmarking scenarios:
+
+#### **1. Quick Benchmark** (`quick_benchmark.sh`)
+
+- **Purpose**: Fast performance validation
+- **Duration**: ~2-3 minutes
+- **Tests**: Throughput, latency, consumption, fault tolerance
+- **Use Case**: Quick validation after changes
+
+```bash
+chmod +x quick_benchmark.sh
+./quick_benchmark.sh
+```
+
+#### **2. Comprehensive Benchmark Suite** (`benchmark_suite.sh`)
+
+- **Purpose**: Complete performance analysis
+- **Duration**: ~10-15 minutes
+- **Tests**: All performance metrics, resource usage, fault tolerance
+- **Use Case**: Full system validation and performance profiling
+
+```bash
+chmod +x benchmark_suite.sh
+./benchmark_suite.sh
+```
+
+#### **3. High Performance Benchmark** (`high_performance_benchmark.sh`)
+
+- **Purpose**: Peak performance testing (target 17K+ msgs/sec)
+- **Duration**: ~5-8 minutes
+- **Tests**: Optimized throughput, latency under load, sustained performance
+- **Use Case**: Performance optimization and peak load testing
+
+```bash
+chmod +x high_performance_benchmark.sh
+./high_performance_benchmark.sh
+```
+
+#### **4. Industry Benchmark** (`industry_benchmark.sh`)
+
+- **Purpose**: Industry-standard comparison
+- **Duration**: ~8-12 minutes
+- **Tests**: Industry-standard metrics comparison, professional reporting
+- **Use Case**: Production readiness validation and industry comparison
+
+```bash
+chmod +x industry_benchmark.sh
+./industry_benchmark.sh
+```
+
+### **Manual Testing**
 
 ```bash
 # High-throughput test
@@ -417,19 +480,10 @@ done
 for i in {1..10}; do
   curl "http://localhost:8080/topics/test/partitions/0/consume?offset=0&limit=100" &
 done
-```
 
-### **Failure Testing**
-
-```bash
-# Kill a broker and observe automatic rebalancing
+# Failure testing
 kill -9 $BROKER_PID
-
-# Check cluster status
 curl http://localhost:8080/cluster/status | jq .
-
-# Verify data consistency
-curl http://localhost:8080/topics/test/partitions/0/consume?offset=0&limit=10
 ```
 
 ---
@@ -442,27 +496,41 @@ curl http://localhost:8080/topics/test/partitions/0/consume?offset=0&limit=10
 version: "3.8"
 services:
   broker1:
-    image: your-registry/kafka-broker:latest
+    image: kafka-broker:latest
     environment:
       - NODE_ID=broker1
       - CLUSTER_PORT=7946
       - PORT=8080
     volumes:
-      - /data/broker1:/app/data
+      - ./data/broker1:/home/appuser/data
+    ports:
+      - "8080:8080"
+      - "7946:7946"
+      - "8946:8946"
     networks:
       - kafka-cluster
 
   broker2:
-    image: your-registry/kafka-broker:latest
+    image: kafka-broker:latest
     environment:
       - NODE_ID=broker2
       - CLUSTER_PORT=7947
       - PORT=8081
       - SEEDS=broker1:7946
     volumes:
-      - /data/broker2:/app/data
+      - ./data/broker2:/home/appuser/data
+    ports:
+      - "8081:8081"
+      - "7947:7947"
+      - "8947:8947"
     networks:
       - kafka-cluster
+    depends_on:
+      - broker1
+
+networks:
+  kafka-cluster:
+    driver: bridge
 ```
 
 ### **Kubernetes Deployment**
@@ -479,15 +547,46 @@ spec:
     spec:
       containers:
         - name: broker
-          image: your-registry/kafka-broker:latest
+          image: kafka-broker:latest
           ports:
             - containerPort: 8080
+              name: api
             - containerPort: 7946
+              name: gossip
+            - containerPort: 8946
+              name: raft
           env:
             - name: NODE_ID
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            - name: CLUSTER_PORT
+              value: "7946"
+            - name: PORT
+              value: "8080"
+          volumeMounts:
+            - name: data
+              mountPath: /home/appuser/data
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
 ```
 
 ---
@@ -555,22 +654,136 @@ spec:
 
 ---
 
-## 🤝 **Contributing**
+## 📁 **Project Structure**
 
-I am open to contributions!
+```
+distributed-kafka-system/
+├── cmd/
+│   └── broker/
+│       └── main.go              # Main application entry point
+├── internal/
+│   ├── broker/
+│   │   └── broker.go            # Core broker implementation
+│   ├── cluster/
+│   │   ├── cluster.go           # Cluster management
+│   │   └── raft.go              # Raft consensus implementation
+│   ├── config/
+│   │   └── config.go            # Configuration management
+│   ├── message/
+│   │   └── message.go           # Message structures
+│   ├── metrics/
+│   │   └── metrics.go           # Metrics collection
+│   ├── offset/
+│   │   └── manager.go           # Offset management
+│   ├── partition/
+│   │   └── partition.go         # Partition handling
+│   ├── replication/
+│   │   ├── replica.go           # Replica management
+│   │   └── replication.go       # Replication logic
+│   └── storage/
+│       ├── disk.go              # Disk storage
+│       ├── memory.go            # Memory storage
+│       ├── partition.go         # Partition storage
+│       ├── segment.go           # Segment management
+│       ├── storage.go           # Storage interface
+│       └── wal.go               # Write-Ahead Log
+├── pkg/
+│   └── api/
+│       ├── consumer.go          # Consumer API
+│       └── producer.go          # Producer API
+├── benchmark_suite.sh           # Comprehensive benchmark suite
+├── high_performance_benchmark.sh # High performance testing
+├── industry_benchmark.sh        # Industry comparison testing
+├── quick_benchmark.sh           # Quick performance validation
+├── docker-compose.yml           # Multi-broker Docker setup
+├── Dockerfile                   # Production Docker image
+├── go.mod                       # Go module dependencies
+└── README.md                    # This file
+```
 
-## 📞 **Support**
+## 🚀 **Getting Started with Testing**
 
-- **Issues**: [GitHub Issues](https://github.com/prateekbala/distributed-kafka-system/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/prateekbala/distributed-kafka-system/discussions)
+1. **Start your cluster**:
+
+   ```bash
+   # Terminal 1 - Leader
+   go run ./cmd/broker/main.go --node-id=node1 --port=8081 --cluster-port=7966 --address=127.0.0.1 --data-dir=data-node1
+
+   # Terminal 2 - Follower
+   go run ./cmd/broker/main.go --node-id=node2 --port=8082 --cluster-port=7967 --address=127.0.0.1 --data-dir=data-node2 --seeds=127.0.0.1:7966
+   ```
+
+2. **Run quick validation**:
+
+   ```bash
+   chmod +x quick_benchmark.sh
+   ./quick_benchmark.sh
+   ```
+
+3. **Run comprehensive testing**:
+
+   ```bash
+   chmod +x benchmark_suite.sh
+   ./benchmark_suite.sh
+   ```
+
+4. **Check results**:
+   ```bash
+   ls -la benchmark_results/
+   cat benchmark_results/benchmark_summary_*.txt
+   ```
+
+## 🔧 **Configuration Options**
+
+### **Command Line Flags**
+
+```bash
+go run ./cmd/broker/main.go [flags]
+
+Flags:
+  --node-id string        Unique node identifier (default "broker1")
+  --port int             API server port (default 8080)
+  --cluster-port int     Cluster communication port (default 7946)
+  --address string       Bind address (default "0.0.0.0")
+  --data-dir string      Data directory (default "data")
+  --seeds string         Seed nodes for cluster discovery
+  --wal-enabled          Enable Write-Ahead Logging (default true)
+  --segment-size int     Segment file size in bytes (default 10485760)
+  --gossip-interval int  Gossip protocol interval in seconds (default 2)
+```
+
+### **Environment Variables**
+
+```bash
+export NODE_ID=broker1
+export PORT=8080
+export CLUSTER_PORT=7946
+export ADDRESS=0.0.0.0
+export DATA_DIR=data
+export SEEDS=127.0.0.1:7946
+export WAL_ENABLED=true
+export SEGMENT_SIZE=10485760
+export GOSSIP_INTERVAL=2
+```
 
 ---
 
-<div align="center">
+## 🤝 **Contributing**
 
-**⭐ Star this repository if you found it helpful!**
+I am open to contributions! Please feel free to:
 
-[![GitHub stars](https://img.shields.io/github/stars/prateekbala/distributed-kafka-system?style=social)](https://github.com/prateekbala/distributed-kafka-system)
-[![GitHub forks](https://img.shields.io/github/forks/prateekbala/distributed-kafka-system?style=social)](https://github.com/prateekbala/distributed-kafka-system)
+- Report bugs and issues
+- Suggest new features
+- Submit pull requests
+- Improve documentation
+- Add more test scenarios
 
-</div>
+### **Development Setup**
+
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Run the test suite: `./benchmark_suite.sh`
+5. Submit a pull request
+
+---
